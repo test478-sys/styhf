@@ -563,12 +563,14 @@
     const placeholder = document.getElementById('placeholder');
     const loadingOverlay = document.getElementById('loadingOverlay');
 
-    // Worker code
-    // Worker code
+    // IMPROVED Worker code with better JS module handling
     const workerCode = `// =====================================================
-// Cloudflare Worker - FULL Web Proxy
-// Proxies ALL resources (HTML, CSS, JS, images, etc.)
+// Cloudflare Worker - FULL Web Proxy v2
+// Fixed: Better ES module import handling
 // =====================================================
+
+// KV namespace for tracking origins (optional but helpful)
+// You can create a KV namespace in Cloudflare dashboard
 
 export default {
   async fetch(request, env, ctx) {
@@ -588,25 +590,57 @@ export default {
     
     // Get target URL from ?url= parameter
     let targetUrl = url.searchParams.get('url');
+    let originFromCookie = null;
 
-    // If no ?url= param but has a path, resolve against Referer
+    // Check for origin cookie (fallback for module imports)
+    const cookies = request.headers.get('Cookie') || '';
+    const originMatch = cookies.match(/proxy_origin=([^;]+)/);
+    if (originMatch) {
+      try {
+        originFromCookie = decodeURIComponent(originMatch[1]);
+      } catch {}
+    }
+
+    // If no ?url= param but has a path, try multiple resolution strategies
     if (!targetUrl && url.pathname !== '/') {
+      // Strategy 1: Use Referer header
       const referer = request.headers.get('Referer') || '';
       const refererMatch = referer.match(/[?&]url=([^&]+)/);
+      
       if (refererMatch) {
         try {
           const refUrl = decodeURIComponent(refererMatch[1]);
           const refUrlObj = new URL(refUrl);
-          const refDir = refUrl.substring(0, refUrl.lastIndexOf('/') + 1) || refUrlObj.origin + '/';
           
-          // Handle absolute paths (starting with /) vs relative paths
           if (url.pathname.startsWith('/')) {
             targetUrl = refUrlObj.origin + url.pathname + url.search;
           } else {
+            const refDir = refUrl.substring(0, refUrl.lastIndexOf('/') + 1) || refUrlObj.origin + '/';
             targetUrl = new URL(url.pathname + url.search, refDir).href;
           }
         } catch (e) {
           console.error('Referer resolution error:', e);
+        }
+      }
+      
+      // Strategy 2: Use origin cookie if Referer didn't work
+      if (!targetUrl && originFromCookie) {
+        try {
+          if (url.pathname.startsWith('/')) {
+            targetUrl = originFromCookie + url.pathname + url.search;
+          }
+        } catch {}
+      }
+      
+      // Strategy 3: Check X-Proxy-Origin header (set by our injected script)
+      if (!targetUrl) {
+        const proxyOrigin = request.headers.get('X-Proxy-Origin');
+        if (proxyOrigin) {
+          try {
+            if (url.pathname.startsWith('/')) {
+              targetUrl = proxyOrigin + url.pathname + url.search;
+            }
+          } catch {}
         }
       }
     }
@@ -614,8 +648,15 @@ export default {
     if (!targetUrl) {
       return new Response(JSON.stringify({
         error: 'Missing url parameter',
-        usage: 'Add ?url=https://example.com to proxy a website',
-        example: url.origin + '?url=https://example.com',
+        debug: {
+          pathname: url.pathname,
+          search: url.search,
+          referer: request.headers.get('Referer') || 'none',
+          refererUrlParam: 'not found',
+          originCookie: originFromCookie || 'none'
+        },
+        hint: 'Requests without ?url= need a valid Referer with ?url= param',
+        usage: workerOrigin + '?url=https://example.com',
       }, null, 2), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -637,7 +678,7 @@ export default {
         method: request.method,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': '*/*',
+          'Accept': request.headers.get('Accept') || '*/*',
           'Accept-Language': 'en-US,en;q=0.9',
           'Referer': parsedTarget.origin,
         },
@@ -674,7 +715,9 @@ export default {
       if (contentType.includes('text/html')) {
         let content = await response.text();
         const baseHref = baseUrl.href;
+        const targetOrigin = baseUrl.origin;
 
+        // Rewrite standard attributes
         content = content.replace(
           /(src|href|action|poster|data-src|data-href)=(["'])([^"']*?)\\2/gi,
           (match, attr, quote, value) => {
@@ -683,6 +726,7 @@ export default {
           }
         );
 
+        // Rewrite srcset
         content = content.replace(
           /srcset=(["'])([^"']+)\\1/gi,
           (match, quote, srcset) => {
@@ -695,6 +739,7 @@ export default {
           }
         );
 
+        // Rewrite CSS url()
         content = content.replace(
           /url\\((['"]?)([^)'"\\s]+)\\1\\)/gi,
           (match, quote, urlValue) => {
@@ -703,6 +748,7 @@ export default {
           }
         );
 
+        // Rewrite @import
         content = content.replace(
           /@import\\s+(['"])([^'"]+)\\1/gi,
           (match, quote, importUrl) => {
@@ -711,11 +757,22 @@ export default {
           }
         );
 
+        // CRITICAL: Inject script that patches ES module loading
         const proxyScript = \`
           <script>
             (function() {
               const PROXY_BASE = '\${workerOrigin}';
-              const ORIGINAL_ORIGIN = '\${baseUrl.origin}';
+              const ORIGINAL_ORIGIN = '\${targetOrigin}';
+              const ORIGINAL_BASE = '\${baseHref}';
+              
+              // Set cookie for fallback origin resolution
+              document.cookie = 'proxy_origin=' + encodeURIComponent(ORIGINAL_ORIGIN) + '; path=/; SameSite=Lax';
+              
+              // Store original origin in sessionStorage too
+              try {
+                sessionStorage.setItem('proxy_origin', ORIGINAL_ORIGIN);
+                sessionStorage.setItem('proxy_base', ORIGINAL_BASE);
+              } catch {}
               
               function proxyUrl(url) {
                 if (!url || url.startsWith('data:') || url.startsWith('javascript:') || 
@@ -732,6 +789,7 @@ export default {
                   } else if (url.startsWith('/')) {
                     absolute = ORIGINAL_ORIGIN + url;
                   } else {
+                    // For relative paths, use the original base URL
                     const currentUrl = new URL(window.location.href);
                     const realUrl = currentUrl.searchParams.get('url');
                     if (realUrl) {
@@ -745,6 +803,7 @@ export default {
                 } catch { return url; }
               }
 
+              // Intercept link clicks
               document.addEventListener('click', function(e) {
                 const link = e.target.closest('a[href]');
                 if (link) {
@@ -763,6 +822,7 @@ export default {
                 }
               }, true);
 
+              // Intercept form submissions
               document.addEventListener('submit', function(e) {
                 const form = e.target;
                 const action = form.getAttribute('action') || window.location.href;
@@ -786,6 +846,7 @@ export default {
                 }
               }, true);
 
+              // Intercept fetch
               const originalFetch = window.fetch;
               window.fetch = function(input, init) {
                 let url = typeof input === 'string' ? input : (input instanceof Request ? input.url : input);
@@ -800,6 +861,7 @@ export default {
                 return originalFetch.call(this, input, init);
               };
 
+              // Intercept XHR
               const originalXHROpen = XMLHttpRequest.prototype.open;
               XMLHttpRequest.prototype.open = function(method, url, ...rest) {
                 if (url && typeof url === 'string' && !url.startsWith('data:') && !url.startsWith('blob:')) {
@@ -808,6 +870,7 @@ export default {
                 return originalXHROpen.call(this, method, url, ...rest);
               };
 
+              // Watch for dynamically added elements
               const observer = new MutationObserver((mutations) => {
                 mutations.forEach((mutation) => {
                   mutation.addedNodes.forEach((node) => {
@@ -843,6 +906,8 @@ export default {
         const newHeaders = new Headers(corsHeaders);
         newHeaders.set('Content-Type', 'text/html; charset=utf-8');
         newHeaders.set('X-Final-URL', finalUrl);
+        // Set cookie for origin tracking
+        newHeaders.set('Set-Cookie', 'proxy_origin=' + encodeURIComponent(targetOrigin) + '; path=/; SameSite=Lax');
 
         return new Response(content, { status: response.status, headers: newHeaders });
       }
@@ -870,16 +935,49 @@ export default {
         return new Response(content, { status: response.status, headers: newHeaders });
       }
 
-      // Process JavaScript
+      // Process JavaScript - CRITICAL for ES modules
       if (contentType.includes('javascript') || targetUrl.endsWith('.js') || targetUrl.endsWith('.mjs')) {
         let content = await response.text();
         const baseHref = baseUrl.href;
+        const scriptOrigin = baseUrl.origin;
         
+        // Rewrite static imports: import x from './path'
+        content = content.replace(
+          /\\bimport\\s+([^'"]*?)\\s+from\\s+(['"\`])([^'"\`]+)\\2/g,
+          (match, imports, quote, importPath) => {
+            if (importPath.startsWith('http') || importPath.includes('?url=')) return match;
+            const proxied = toProxyUrl(importPath, baseHref);
+            return 'import ' + imports + ' from ' + quote + proxied + quote;
+          }
+        );
+        
+        // Rewrite static imports: import './path'
+        content = content.replace(
+          /\\bimport\\s+(['"\`])([^'"\`]+)\\1\\s*;/g,
+          (match, quote, importPath) => {
+            if (importPath.startsWith('http') || importPath.includes('?url=')) return match;
+            const proxied = toProxyUrl(importPath, baseHref);
+            return 'import ' + quote + proxied + quote + ';';
+          }
+        );
+        
+        // Rewrite dynamic imports: import('./path')
         content = content.replace(
           /\\bimport\\s*\\(\\s*(['"\`])([^'"\`]+)\\1\\s*\\)/g,
           (match, quote, importPath) => {
             if (importPath.includes('?url=') || importPath.includes('\${')) return match;
-            return 'import(' + quote + toProxyUrl(importPath, baseHref) + quote + ')';
+            const proxied = toProxyUrl(importPath, baseHref);
+            return 'import(' + quote + proxied + quote + ')';
+          }
+        );
+        
+        // Rewrite export from: export { x } from './path'
+        content = content.replace(
+          /\\bexport\\s+([^'"]*?)\\s+from\\s+(['"\`])([^'"\`]+)\\2/g,
+          (match, exports, quote, importPath) => {
+            if (importPath.startsWith('http') || importPath.includes('?url=')) return match;
+            const proxied = toProxyUrl(importPath, baseHref);
+            return 'export ' + exports + ' from ' + quote + proxied + quote;
           }
         );
         
@@ -1065,4 +1163,3 @@ export default {
   </script>
 </body>
 </html>
-
